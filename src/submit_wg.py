@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import time
 from pathlib import Path
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
@@ -26,6 +27,23 @@ def dismiss_overlays(page: Page):
             break
         except PlaywrightTimeoutError:
             pass
+
+
+def dismiss_security_advice(page: Page, logger) -> None:
+    modal = page.locator("#sec_advice")
+    if modal.is_visible():
+        try:
+            page.locator("#sec_advice_submit_button").click(timeout=5000)
+            modal.wait_for(state="hidden", timeout=5000)
+            logger.info("Dismissed security advice modal.")
+        except PlaywrightTimeoutError:
+            logger.info("Security advice modal visible but could not dismiss.")
+
+    try:
+        page.locator("#sicherheit_bestaetigung").click(timeout=2000)
+        logger.info("Confirmed legacy security check.")
+    except PlaywrightTimeoutError:
+        pass
 
 
 def open_login_modal(page: Page):
@@ -102,16 +120,33 @@ class SubmitSession:
         self._login()
 
     def _start_browser(self):
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
-            headless=self.config["run_headless"]
-        )
-        self._context = self._browser.new_context(
-            viewport={"width": 1920, "height": 1080}
-            if self.config["run_headless"]
-            else None,
-        )
-        self._page = self._context.new_page()
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                self._playwright = sync_playwright().start()
+                self._browser = self._playwright.chromium.launch(
+                    headless=self.config["run_headless"],
+                    args=[
+                        "--disable-dev-shm-usage",
+                        "--no-sandbox",
+                        "--disable-gpu",
+                    ],
+                )
+                self._context = self._browser.new_context(
+                    viewport={"width": 1920, "height": 1080}
+                    if self.config["run_headless"]
+                    else None,
+                )
+                self._page = self._context.new_page()
+                return
+            except Exception as exc:
+                last_error = exc
+                self.logger.info(
+                    f"Browser start attempt {attempt}/3 failed: {exc}"
+                )
+                self.close()
+                time.sleep(2 * attempt)
+        raise RuntimeError(f"Could not start browser: {last_error}")
 
     def _login(self, page: Page | None = None):
         page = page or self._page
@@ -143,10 +178,21 @@ class SubmitSession:
     def restart(self):
         self.logger.info("Restarting browser session...")
         self.close()
+        time.sleep(1)
         self._start_browser()
         self._login()
 
     def close(self):
+        if self._page:
+            try:
+                self._page.close()
+            except Exception:
+                pass
+        if self._context:
+            try:
+                self._context.close()
+            except Exception:
+                pass
         if self._browser:
             try:
                 self._browser.close()
@@ -157,9 +203,9 @@ class SubmitSession:
                 self._playwright.stop()
             except Exception:
                 pass
-        self._browser = None
-        self._context = None
         self._page = None
+        self._context = None
+        self._browser = None
         self._playwright = None
 
     def __enter__(self):
@@ -173,7 +219,7 @@ class SubmitSession:
 
         return ListingGetter(url, page=self._page).get_all_infos()
 
-    def submit(self, config) -> bool:
+    def submit(self, config) -> bool | str:
         page = self._page
         try:
             page.goto(
@@ -194,12 +240,9 @@ class SubmitSession:
 
             if not page.locator("#message_input").is_visible(timeout=5000):
                 self.logger.info("Message form not available — login may have failed.")
-                return False
+                return "no_message_form"
 
-            try:
-                page.locator("#sicherheit_bestaetigung").click(timeout=3000)
-            except PlaywrightTimeoutError:
-                self.logger.info("No security check.")
+            dismiss_security_advice(page, self.logger)
 
             if page.locator("#message_timestamp").count() > 0:
                 self.logger.info(
@@ -225,9 +268,10 @@ class SubmitSession:
                     message = load_template(message_file)
                 except FileNotFoundError:
                     self.logger.info(f"{message_file} file not found!")
-                    return False
+                    return "message_file_not_found"
 
             text_area.fill(message)
+            dismiss_security_advice(page, self.logger)
 
             attachment_file = config.get("attachment_file", "")
             if attachment_file:
@@ -243,22 +287,24 @@ class SubmitSession:
                     )
 
             submit_button = page.locator(
+                "button.conversation_send_button.create_new_conversation, "
                 "button.conversation_send_button, "
                 "button[data-ng-click='submit()'], "
                 "button:has-text('Nachricht senden'), "
                 "button:has-text('Senden')"
-            )
-            submit_button.click(timeout=10000)
+            ).first
+            submit_button.scroll_into_view_if_needed(timeout=5000)
+            submit_button.click(timeout=15000)
             self.logger.info(f">>>> Message sent to: {config['ref']} <<<<")
             page.wait_for_timeout(2000)
             return True
 
         except PlaywrightTimeoutError:
             self.logger.info("Cannot find submit button or page element timed out!")
-            return False
+            return "timeout"
         except RuntimeError as e:
             self.logger.info(str(e))
-            return False
+            return "login_failed"
 
 
 def submit_app(config, logger):

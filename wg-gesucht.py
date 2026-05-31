@@ -110,7 +110,11 @@ def get_listings_with_retry(session, url):
         return session.get_listings(url)
     except Exception:
         logger.exception("Listing fetch failed, restarting browser session...")
-        session.restart()
+        try:
+            session.restart()
+        except Exception:
+            logger.exception("Browser restart failed.")
+            raise
         return session.get_listings(url)
 
 
@@ -119,7 +123,11 @@ def submit_with_retry(session, config):
         return session.submit(config)
     except Exception:
         logger.exception("Submit failed, restarting browser session...")
-        session.restart()
+        try:
+            session.restart()
+        except Exception:
+            logger.exception("Browser restart failed.")
+            return "browser_restart_failed"
         return session.submit(config)
 
 
@@ -137,8 +145,8 @@ def is_within_rental_start(listing, rental_start_config) -> bool:
 
 
 def skip_reason(listing, config, contacted_pairs: set[tuple[str, str]] | None = None) -> str | None:
-    rental_start_config = config["rental_start"]
-    if not is_within_rental_start(listing, rental_start_config):
+    rental_start_config = config.get("rental_start")
+    if rental_start_config and not is_within_rental_start(listing, rental_start_config):
         desired = datetime.datetime(
             rental_start_config["year"],
             rental_start_config["month"],
@@ -245,9 +253,24 @@ def run_once(config, store, session):
             config["message"] = build_message(config, listing, listing_text, logger)
 
             submit_result = submit_with_retry(session, config)
-            if submit_result in (True, "already_sent"):
+            if submit_result is True or submit_result == "already_sent":
                 store.mark_contacted(listing["user_name"], listing["address"], ref)
                 messages_sent_this_cycle += 1
+            else:
+                error = (
+                    submit_result
+                    if isinstance(submit_result, str)
+                    else "submit failed"
+                )
+                store.mark_failed(
+                    listing["user_name"],
+                    listing["address"],
+                    ref,
+                    error=error,
+                )
+                logger.info(
+                    f"Send failed for {ref} ({error}) — recorded in failed_listings."
+                )
 
     store.mark_seen(current_listings)
 

@@ -37,6 +37,15 @@ class ListingStore:
                     contacted_at TEXT NOT NULL DEFAULT (datetime('now')),
                     PRIMARY KEY (user_name, address)
                 );
+
+                CREATE TABLE IF NOT EXISTS failed_listings (
+                    ref TEXT PRIMARY KEY,
+                    user_name TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    fail_count INTEGER NOT NULL DEFAULT 1,
+                    last_failed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_error TEXT
+                );
                 """
             )
 
@@ -145,4 +154,21 @@ class ListingStore:
                 VALUES (?, ?, ?)
                 """,
                 (user_name, address, ref),
+            )
+            conn.execute("DELETE FROM failed_listings WHERE ref = ?", (ref,))
+
+    def mark_failed(
+        self, user_name: str, address: str, ref: str, error: str = ""
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO failed_listings (ref, user_name, address, last_error)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(ref) DO UPDATE SET
+                    fail_count = fail_count + 1,
+                    last_failed_at = datetime('now'),
+                    last_error = excluded.last_error
+                """,
+                (ref, user_name, address, error[:500]),
             )
